@@ -1,21 +1,37 @@
 <?php
 /**
  * Loshare — LAN file transfer (single PHP file).
- * Run from this directory: php -S 0.0.0.0:8080
- * Open http://<this-machine-LAN-IP>:8080/ on your phone and PC.
+ * Run from this directory: php -S 0.0.0.0:PORT index.php  (index.php = router for /pc/ and /phone/)
+ * Use start-loshare scripts for high upload limits.
  */
 
-$uploadsDir = __DIR__ . '/uploads';
-$filesDir   = __DIR__ . '/files';
-if (!is_dir($uploadsDir)) {
-    mkdir($uploadsDir, 0777, true);
-}
-if (!is_dir($filesDir)) {
-    mkdir($filesDir, 0777, true);
+$uploadsRoot = __DIR__ . '/uploads';
+$pcDir       = $uploadsRoot . '/pc';
+$phoneDir    = $uploadsRoot . '/phone';
+foreach ([$uploadsRoot, $pcDir, $phoneDir] as $d) {
+    if (!is_dir($d)) {
+        mkdir($d, 0777, true);
+    }
 }
 
 $method = $_SERVER['REQUEST_METHOD'];
 $action = isset($_GET['action']) ? $_GET['action'] : '';
+
+// Built-in PHP server router: allow direct serving of static assets.
+// Only whitelisted to `/assets/*` (never serve uploads directly as static files).
+if (PHP_SAPI === 'cli-server') {
+    $reqPath = parse_url(isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '/', PHP_URL_PATH);
+    if (is_string($reqPath) && strpos($reqPath, '/assets/') === 0) {
+        $assetsRoot = realpath(__DIR__ . '/assets');
+        $candidate  = realpath(__DIR__ . $reqPath);
+        if ($assetsRoot && $candidate && is_file($candidate)) {
+            $prefix = $assetsRoot . DIRECTORY_SEPARATOR;
+            if (strpos($candidate, $prefix) === 0) {
+                return false;
+            }
+        }
+    }
+}
 
 /** Web path prefix when not served from document root (e.g. /subdir/index.php). */
 function web_path_prefix() {
@@ -27,7 +43,7 @@ function web_path_prefix() {
     return trim($d, '/');
 }
 
-/** Build URL path /[prefix/]files|uploads/name */
+/** Build URL path /[prefix/]pc|phone/name */
 function file_public_path($which, $filename) {
     $prefix = web_path_prefix();
     $parts = [];
@@ -45,6 +61,113 @@ function safe_name($name) {
     return $name;
 }
 
+function loshare_is_https() {
+    if (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') {
+        return true;
+    }
+    if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && strtolower((string) $_SERVER['HTTP_X_FORWARDED_PROTO']) === 'https') {
+        return true;
+    }
+    return false;
+}
+
+function loshare_send_common_headers() {
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: DENY');
+    header('Referrer-Policy: no-referrer');
+    header('Permissions-Policy: geolocation=(), microphone=(), camera=()');
+    header("Content-Security-Policy: default-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'");
+    if (loshare_is_https()) {
+        header('Strict-Transport-Security: max-age=15552000; includeSubDomains');
+    }
+}
+
+/** Convert php.ini size shorthand to bytes (e.g. 8M, 2048K). */
+function ini_bytes($val) {
+    $val = trim((string) $val);
+    if ($val === '') {
+        return 0;
+    }
+    $u = strtolower(substr($val, -1));
+    $n = (float) $val;
+    if ($u === 'g') {
+        return (int) round($n * 1024 * 1024 * 1024);
+    }
+    if ($u === 'm') {
+        return (int) round($n * 1024 * 1024);
+    }
+    if ($u === 'k') {
+        return (int) round($n * 1024);
+    }
+    return (int) $n;
+}
+
+/** Best-effort LAN IPv4 list for the machine running PHP (may be empty if shell_exec is disabled). */
+function loshare_detect_ipv4s() {
+    $ips = [];
+    $saddr = isset($_SERVER['SERVER_ADDR']) ? $_SERVER['SERVER_ADDR'] : '';
+    if ($saddr !== '' && $saddr !== '0.0.0.0' && filter_var($saddr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+        $ips[] = $saddr;
+    }
+    if (!function_exists('shell_exec')) {
+        return array_values(array_unique($ips));
+    }
+    $df = ini_get('disable_functions');
+    if (is_string($df) && stripos($df, 'shell_exec') !== false) {
+        return array_values(array_unique($ips));
+    }
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $raw = @shell_exec('ipconfig');
+        if (is_string($raw) && preg_match_all('/IPv4[^:\r\n]*:\s*(\d+\.\d+\.\d+\.\d+)/i', $raw, $m)) {
+            foreach ($m[1] as $ip) {
+                if ($ip !== '127.0.0.1') {
+                    $ips[] = $ip;
+                }
+            }
+        }
+    } else {
+        $raw = @shell_exec('hostname -I 2>/dev/null');
+        if (is_string($raw)) {
+            foreach (preg_split('/\s+/', trim($raw)) as $ip) {
+                if ($ip !== '' && $ip !== '127.0.0.1' && strpos($ip, '.') !== false) {
+                    $ips[] = $ip;
+                }
+            }
+        }
+        if ($ips === [] || (count($ips) === 1 && $ips[0] === $saddr)) {
+            $raw = @shell_exec('ip -4 -o addr show scope global 2>/dev/null');
+            if (is_string($raw) && preg_match_all('/inet (\d+\.\d+\.\d+\.\d+)/', $raw, $m)) {
+                foreach ($m[1] as $ip) {
+                    if ($ip !== '127.0.0.1') {
+                        $ips[] = $ip;
+                    }
+                }
+            }
+        }
+    }
+    return array_values(array_unique($ips));
+}
+
+if ($method === 'GET' && $action === 'hints') {
+    $port = isset($_SERVER['SERVER_PORT']) ? (int) $_SERVER['SERVER_PORT'] : 80;
+    $um = ini_get('upload_max_filesize');
+    $pm = ini_get('post_max_size');
+    loshare_send_common_headers();
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo json_encode([
+        'ipv4' => loshare_detect_ipv4s(),
+        'port' => $port,
+        'upload_max_filesize' => $um,
+        'post_max_size' => $pm,
+        'upload_max_bytes' => ini_bytes($um),
+        'post_max_bytes' => ini_bytes($pm),
+        'limits_tight' => (ini_bytes($um) < 64 * 1024 * 1024) || (ini_bytes($pm) < 64 * 1024 * 1024),
+        'sapi' => PHP_SAPI,
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
 if ($method === 'POST' && $action === 'upload') {
     $results = [];
     if (!empty($_FILES['files'])) {
@@ -54,7 +177,7 @@ if ($method === 'POST' && $action === 'upload') {
             $size = $_FILES['files']['size'][$i];
             if ($err === UPLOAD_ERR_OK && is_uploaded_file($tmp)) {
                 $safe = time() . '_' . safe_name($orig);
-                $dest = $uploadsDir . '/' . $safe;
+                $dest = $phoneDir . '/' . $safe;
                 if (move_uploaded_file($tmp, $dest)) {
                     $results[] = ['ok' => true, 'name' => $safe, 'orig' => $orig, 'size' => $size];
                 } else {
@@ -65,12 +188,14 @@ if ($method === 'POST' && $action === 'upload') {
             }
         }
     }
+    loshare_send_common_headers();
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode($results);
     exit;
 }
 
 if ($method === 'POST' && $action === 'delete') {
+    loshare_send_common_headers();
     header('Content-Type: application/json; charset=utf-8');
     $raw = file_get_contents('php://input');
     $input = json_decode($raw, true);
@@ -79,7 +204,7 @@ if ($method === 'POST' && $action === 'delete') {
     }
     $which = isset($input['which']) ? $input['which'] : '';
     $name  = isset($input['name']) ? $input['name'] : '';
-    if (!in_array($which, ['files', 'uploads'], true)) {
+    if (!in_array($which, ['pc', 'phone'], true)) {
         http_response_code(400);
         echo json_encode(['ok' => false, 'error' => 'invalid_bucket']);
         exit;
@@ -90,7 +215,12 @@ if ($method === 'POST' && $action === 'delete') {
         echo json_encode(['ok' => false, 'error' => 'invalid_name']);
         exit;
     }
-    $base = ($which === 'files') ? $filesDir : $uploadsDir;
+    if (strpos($safe, '.') === 0) {
+        http_response_code(400);
+        echo json_encode(['ok' => false, 'error' => 'dotfiles_not_allowed']);
+        exit;
+    }
+    $base = ($which === 'pc') ? $pcDir : $phoneDir;
     $path = $base . '/' . $safe;
     if (!is_file($path)) {
         http_response_code(404);
@@ -108,10 +238,13 @@ if ($method === 'POST' && $action === 'delete') {
 
 if ($method === 'GET' && $action === 'list') {
     $list = [];
-    foreach (['files' => $filesDir, 'uploads' => $uploadsDir] as $k => $dir) {
+    foreach (['pc' => $pcDir, 'phone' => $phoneDir] as $k => $dir) {
         $entries = [];
         $files = array_values(array_diff(scandir($dir), ['.', '..']));
         foreach ($files as $f) {
+            if (strpos($f, '.') === 0) {
+                continue;
+            }
             $path = $dir . '/' . $f;
             if (!is_file($path)) {
                 continue;
@@ -125,19 +258,24 @@ if ($method === 'GET' && $action === 'list') {
                 'which' => $k,
             ];
         }
+        usort($entries, function ($a, $b) {
+            if ($a['mtime'] === $b['mtime']) return 0;
+            return ($a['mtime'] > $b['mtime']) ? -1 : 1;
+        });
         $list[$k] = $entries;
     }
+    loshare_send_common_headers();
     header('Content-Type: application/json; charset=utf-8');
     echo json_encode($list);
     exit;
 }
 
 $uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '/';
-if (preg_match('#^/(files|uploads)/(.+)$#', parse_url($uri, PHP_URL_PATH), $m)) {
+if (preg_match('#^/(pc|phone)/(.+)$#', parse_url($uri, PHP_URL_PATH), $m)) {
     $which = $m[1];
     $name  = rawurldecode($m[2]);
     $safe = basename($name);
-    $base = ($which === 'files') ? $filesDir : $uploadsDir;
+    $base = ($which === 'pc') ? $pcDir : $phoneDir;
     $path = $base . '/' . $safe;
     if (is_file($path)) {
         $finfo = finfo_open(FILEINFO_MIME_TYPE);
@@ -148,14 +286,16 @@ if (preg_match('#^/(files|uploads)/(.+)$#', parse_url($uri, PHP_URL_PATH), $m)) 
         if (!$mime) {
             $mime = 'application/octet-stream';
         }
+        loshare_send_common_headers();
         header('Content-Type: ' . $mime);
         header('Content-Length: ' . filesize($path));
-        header('Content-Disposition: attachment; filename="' . rawurlencode($safe) . '"');
-        header('X-Content-Type-Options: nosniff');
+        $fallback = preg_replace('/[^A-Za-z0-9._-]/', '_', $safe);
+        header('Content-Disposition: attachment; filename="' . $fallback . '"; filename*=UTF-8\'\'' . rawurlencode($safe));
         readfile($path);
         exit;
     }
     http_response_code(404);
+    loshare_send_common_headers();
     header('Content-Type: text/plain; charset=utf-8');
     echo 'Not found';
     exit;
@@ -165,19 +305,22 @@ $limits = [
     'upload_max_filesize' => ini_get('upload_max_filesize'),
     'post_max_size' => ini_get('post_max_size'),
     'max_file_uploads' => (int) ini_get('max_file_uploads'),
+    'limits_tight' => (ini_bytes(ini_get('upload_max_filesize')) < 64 * 1024 * 1024)
+        || (ini_bytes(ini_get('post_max_size')) < 64 * 1024 * 1024),
 ];
 $configJson = json_encode($limits, JSON_UNESCAPED_UNICODE);
+$assetsVersion = @filemtime(__DIR__ . '/assets/js/kjua.min.js') ?: 1;
 ?><!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="description" content="Loshare — transfer files between your phone and PC on the same Wi‑Fi. One PHP file, no cloud.">
+<meta name="description" content="Loshare — transfer files between your phone and PC on the same local network. One PHP file, no cloud.">
 <meta name="theme-color" content="#0c1117">
 <title>Loshare — LAN file transfer</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
+<!-- <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet"> -->
 <style>
 :root {
   --bg0: #080b0f;
@@ -389,6 +532,36 @@ h1 { font-size: 1.35rem; font-weight: 700; margin: 0; letter-spacing: -0.02em; }
   border-radius: 6px;
 }
 .limits { margin-top: 10px; font-size: 0.75rem; opacity: 0.9; }
+.limits.warn {
+  color: #fcd34d;
+  border-left: 3px solid rgba(252, 211, 77, 0.6);
+  padding-left: 12px;
+  margin-top: 12px;
+}
+.hints-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.hints-list li {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  margin-bottom: 8px;
+  word-break: break-all;
+}
+.hints-list a { color: var(--accent); }
+.hint-cmd {
+  margin-top: 10px;
+  padding: 10px 12px;
+  background: rgba(0,0,0,0.35);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
 #toast[aria-hidden="true"] { display: none; }
 #toast {
   position: fixed;
@@ -418,7 +591,7 @@ a.btn { text-decoration: none; display: inline-block; }
       <div class="mark" aria-hidden="true">⇄</div>
       <div>
         <h1>Loshare</h1>
-        <p class="tagline">Move files between your phone and PC on the same network. No accounts, no cloud.</p>
+        <p class="tagline">Move files between your phone and PC on the same local network (Wi‑Fi or phone hotspot). No accounts, no cloud.</p>
       </div>
     </div>
     <div class="toolbar">
@@ -431,15 +604,20 @@ a.btn { text-decoration: none; display: inline-block; }
       <h2 id="share-heading">Open on another device</h2>
       <div class="share-row">
         <div style="flex:1;min-width:min(100%,200px)">
-          <p class="drop-hint" style="margin:0 0 10px">Use this address on your phone or tablet (same Wi‑Fi).</p>
+          <p class="drop-hint" style="margin:0 0 10px">On your phone or tablet, open the same URL as below (must be on the <strong>same network</strong> as this computer—home Wi‑Fi, office LAN, or <strong>mobile hotspot</strong> with this PC connected).</p>
           <div class="url-box" id="pageUrl" tabindex="0"></div>
           <div class="toolbar" style="margin-top:12px">
             <button type="button" class="btn" id="copyUrlBtn">Copy link</button>
           </div>
+          <p class="drop-hint" style="margin-top:14px;margin-bottom:6px">This PC’s addresses (port <strong id="portLabel"></strong> — use whatever port you started PHP with):</p>
+          <ul class="hints-list" id="hintsList" aria-live="polite"></ul>
+          <p class="drop-hint" id="hintsFallback" style="display:none">Could not auto-detect IPs. On Windows run <code style="font-family:var(--mono);font-size:0.8rem">ipconfig</code> and use your Wi‑Fi/Ethernet <strong>IPv4 Address</strong> (not “Default Gateway” — that’s usually your router).</p>
         </div>
-        <div class="qr-wrap" aria-hidden="true"><canvas id="qrCanvas" width="140" height="140"></canvas></div>
+        <div class="qr-wrap" id="qrHost" aria-hidden="true"></div>
       </div>
       <p class="limits" id="limitsNote"></p>
+      <p class="limits warn" id="limitsWarn" style="display:none"></p>
+      <div class="hint-cmd" id="phpCmdHint" style="display:none"></div>
     </section>
 
     <section class="card" aria-labelledby="upload-heading">
@@ -467,26 +645,29 @@ a.btn { text-decoration: none; display: inline-block; }
 
     <div class="grid-2">
       <section class="card" aria-labelledby="pc-heading">
-        <h2 id="pc-heading">PC folder → phone</h2>
-        <p class="drop-hint" style="margin:-8px 0 12px">Put files in the <code style="font-family:var(--mono);font-size:0.8rem">files</code> folder next to <code style="font-family:var(--mono);font-size:0.8rem">index.php</code>, then download here.</p>
+        <h2 id="pc-heading">PC → phone</h2>
+        <p class="drop-hint" style="margin:-8px 0 12px">Put files in <code style="font-family:var(--mono);font-size:0.8rem">uploads/pc</code> on this machine, then download here.</p>
         <div id="pcFiles"></div>
       </section>
       <section class="card" aria-labelledby="up-heading">
         <h2 id="up-heading">Phone → PC</h2>
-        <p class="drop-hint" style="margin:-8px 0 12px">Uploaded files land in the <code style="font-family:var(--mono);font-size:0.8rem">uploads</code> folder.</p>
+        <p class="drop-hint" style="margin:-8px 0 12px">Browser uploads are saved under <code style="font-family:var(--mono);font-size:0.8rem">uploads/phone</code>.</p>
         <div id="uploadedFiles"></div>
       </section>
     </div>
   </main>
 
   <footer class="footer">
-    <strong>Loshare</strong> — run from this folder:
-    <code>php -S 0.0.0.0:8080</code>
-    <span class="limits">Use your machine’s LAN IP in the URL. Trusted network only: anyone on your Wi‑Fi can access this page while it runs.</span>
+    <strong>Loshare</strong> — from this folder use any free port; pass <code>index.php</code> so <code>/pc/</code> and <code>/phone/</code> downloads work, e.g.
+    <code>php -S 0.0.0.0:3000 index.php</code>
+    or <code>php -S 0.0.0.0:8080 index.php</code>.
+    Use <code>start-loshare.bat</code> / <code>start-loshare.ps1</code> for large upload limits.
+    <span class="limits" style="display:block;margin-top:8px">Trusted network only: while running, anyone who can reach this IP and port can use this app.</span>
   </footer>
 </div>
 
-<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js" crossorigin="anonymous"></script>
+<!-- <script src="https://cdn.jsdelivr.net/npm/kjua@0.9.0/dist/kjua.min.js" crossorigin="anonymous"></script> -->
+<script src="assets/js/kjua.min.js?v=<?php echo (int) $assetsVersion; ?>"></script>
 <script>
 (function () {
   const CFG = <?php echo $configJson; ?>;
@@ -500,8 +681,12 @@ a.btn { text-decoration: none; display: inline-block; }
   const refreshBtn = document.getElementById('refreshBtn');
   const pageUrlEl = document.getElementById('pageUrl');
   const copyUrlBtn = document.getElementById('copyUrlBtn');
-  const qrCanvas = document.getElementById('qrCanvas');
   const limitsNote = document.getElementById('limitsNote');
+  const limitsWarn = document.getElementById('limitsWarn');
+  const phpCmdHint = document.getElementById('phpCmdHint');
+  const hintsList = document.getElementById('hintsList');
+  const hintsFallback = document.getElementById('hintsFallback');
+  const portLabel = document.getElementById('portLabel');
   const toast = document.getElementById('toast');
 
   function showToast(msg, isError) {
@@ -545,14 +730,132 @@ a.btn { text-decoration: none; display: inline-block; }
     return map[code] != null ? map[code] : 'Upload failed (' + code + ')';
   }
 
+  function renderQr(href) {
+    var host = document.getElementById('qrHost');
+    if (!host) return;
+    host.innerHTML = '';
+    if (typeof kjua === 'undefined') return;
+    try {
+      var el = kjua({
+        text: href,
+        size: 140,
+        crisp: true,
+        render: 'canvas',
+        fill: '#05251a',
+        back: '#ffffff',
+        quiet: 1,
+        ecLevel: 'M'
+      });
+      if (el) host.appendChild(el);
+    } catch (e) {
+      console.warn('QR', e);
+    }
+  }
+
+  function currentPort() {
+    var p = window.location.port;
+    if (p) return p;
+    return window.location.protocol === 'https:' ? '443' : '80';
+  }
+
+  function buildUrlForIp(ip) {
+    var proto = window.location.protocol;
+    var port = window.location.port;
+    var path = window.location.pathname + window.location.search;
+    var authority = ip;
+    if (port && port !== '80' && port !== '443') {
+      authority = ip + ':' + port;
+    }
+    return proto + '//' + authority + path;
+  }
+
+  function phpRelaunchCmd() {
+    return 'php -d upload_max_filesize=8192M -d post_max_size=8192M -d max_file_uploads=200 -d max_execution_time=0 -S 0.0.0.0:' + currentPort() + ' index.php';
+  }
+
+  var seenIps = {};
+
+  function addHintUrl(url) {
+    if (!hintsList) return;
+    var li = document.createElement('li');
+    var a = document.createElement('a');
+    a.href = url;
+    a.textContent = url;
+    li.appendChild(a);
+    hintsList.appendChild(li);
+    if (hintsFallback) hintsFallback.style.display = 'none';
+  }
+
+  function mergeIp(ip) {
+    if (!ip || ip.indexOf('127.') === 0 || seenIps[ip]) return;
+    seenIps[ip] = true;
+    addHintUrl(buildUrlForIp(ip));
+  }
+
+  function tryGuessLocalIp(cb) {
+    var Ctor = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+    if (!Ctor) return;
+    try {
+      var pc = new Ctor({ iceServers: [] });
+      pc.createDataChannel('');
+      pc.createOffer().then(function (o) { return pc.setLocalDescription(o); }).catch(function () {});
+      pc.onicecandidate = function (e) {
+        if (!e || !e.candidate || !e.candidate.candidate) return;
+        var m = /([0-9]{1,3}(?:\.[0-9]{1,3}){3})/.exec(e.candidate.candidate);
+        if (m && m[1].indexOf('127.') !== 0) cb(m[1]);
+      };
+      setTimeout(function () { try { pc.close(); } catch (x) {} }, 4000);
+    } catch (e) {}
+  }
+
+  function applyLimitsUi() {
+    if (CFG.limits_tight) {
+      limitsWarn.style.display = 'block';
+      limitsWarn.textContent = 'PHP upload limits look small (' + CFG.upload_max_filesize + ' / ' + CFG.post_max_size + '). Large files may fail until you restart PHP with higher limits — use start-loshare or the command below.';
+      phpCmdHint.style.display = 'block';
+      phpCmdHint.textContent = phpRelaunchCmd();
+    } else {
+      limitsWarn.style.display = 'none';
+      phpCmdHint.style.display = 'none';
+    }
+  }
+
+  function loadHints() {
+    if (portLabel) portLabel.textContent = currentPort();
+    if (hintsList) hintsList.innerHTML = '';
+    seenIps = {};
+    applyLimitsUi();
+    fetch('?action=hints')
+      .then(function (r) { return r.json(); })
+      .then(function (h) {
+        if (h.ipv4 && h.ipv4.length) {
+          h.ipv4.forEach(function (ip) { mergeIp(ip); });
+        }
+        tryGuessLocalIp(function (ip) { mergeIp(ip); });
+        setTimeout(function () {
+          if (hintsFallback && hintsList && hintsList.children.length === 0) {
+            hintsFallback.style.display = 'block';
+          }
+        }, 500);
+        if (typeof h.limits_tight === 'boolean') {
+          CFG.limits_tight = h.limits_tight;
+        }
+        applyLimitsUi();
+      })
+      .catch(function () {
+        tryGuessLocalIp(function (ip) { mergeIp(ip); });
+        setTimeout(function () {
+          if (hintsFallback && hintsList && hintsList.children.length === 0) {
+            hintsFallback.style.display = 'block';
+          }
+        }, 500);
+      });
+  }
+
   function setShareUrl() {
     const href = window.location.href.split('#')[0];
     pageUrlEl.textContent = href;
-    if (typeof QRCode !== 'undefined' && qrCanvas) {
-      QRCode.toCanvas(qrCanvas, href, { width: 140, margin: 1, color: { dark: '#05251a', light: '#ffffff' } }, function (err) {
-        if (err) console.warn('QR error', err);
-      });
-    }
+    renderQr(href);
   }
 
   limitsNote.textContent = 'PHP limits: max upload ' + CFG.upload_max_filesize + ' · POST max ' + CFG.post_max_size +
@@ -767,20 +1070,20 @@ a.btn { text-decoration: none; display: inline-block; }
       .then(function (r) { return r.json(); })
       .then(function (data) {
         pcFiles.innerHTML = '';
-        if (!data.files || data.files.length === 0) {
-          pcFiles.innerHTML = '<div class="empty">No files in <code style="font-family:var(--mono)">files</code> yet.</div>';
+        if (!data.pc || data.pc.length === 0) {
+          pcFiles.innerHTML = '<div class="empty">No files in <code style="font-family:var(--mono)">uploads/pc</code> yet.</div>';
         } else {
-          data.files.forEach(function (f) {
-            pcFiles.appendChild(makeRow(f, 'files'));
+          data.pc.forEach(function (f) {
+            pcFiles.appendChild(makeRow(f, 'pc'));
           });
         }
 
         uploadedFiles.innerHTML = '';
-        if (!data.uploads || data.uploads.length === 0) {
-          uploadedFiles.innerHTML = '<div class="empty">Nothing uploaded yet.</div>';
+        if (!data.phone || data.phone.length === 0) {
+          uploadedFiles.innerHTML = '<div class="empty">Nothing in <code style="font-family:var(--mono)">uploads/phone</code> yet.</div>';
         } else {
-          data.uploads.forEach(function (f) {
-            uploadedFiles.appendChild(makeRow(f, 'uploads'));
+          data.phone.forEach(function (f) {
+            uploadedFiles.appendChild(makeRow(f, 'phone'));
           });
         }
       })
@@ -790,8 +1093,13 @@ a.btn { text-decoration: none; display: inline-block; }
       });
   }
 
-  refreshBtn.addEventListener('click', refreshList);
+  refreshBtn.addEventListener('click', function () {
+    setShareUrl();
+    loadHints();
+    refreshList();
+  });
   setShareUrl();
+  loadHints();
   refreshList();
   setInterval(refreshList, 8000);
 })();

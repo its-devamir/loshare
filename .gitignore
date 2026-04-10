@@ -1,8 +1,8 @@
-# User content (keep folders via .gitkeep)
-/files/*
-!/files/.gitkeep
-/uploads/*
-!/uploads/.gitkeep
+# User content
+/uploads/pc/*
+/uploads/phone/*
+!/uploads/pc/.gitkeep
+!/uploads/phone/.gitkeep
 
 # OS / editor
 Thumbs.db

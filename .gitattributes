@@ -1,0 +1,11 @@
+* text=auto
+
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+*.php text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+*.min.js -text
